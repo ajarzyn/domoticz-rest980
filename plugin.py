@@ -9,7 +9,7 @@
     <params>
         <param field="Address" label="rest980's IP Address" width="200px" required="true" default="127.0.0.1"/>
         <param field="Port" label="rest980's Port" width="30px" required="true" default="3000"/>
-        <param field="Mode1" label="Display batter status in name" width="150px">
+        <param field="Mode1" label="Display battery status in name" width="150px">
             <options>
                 <option label="Yes" value="1"/>
                 <option label="No" value="0" default="true"/>
@@ -61,6 +61,8 @@ class Rest980Api:
     def get_local_url(self, command):
         if command in self.actions.keys():
             return self.base_local_url + self.action + self.actions[command]
+        elif command in self.actions.values():
+            return self.base_local_url + self.action + command
         elif command in self.infos:
             return self.base_local_url + self.info + "/" + command
 
@@ -175,24 +177,23 @@ class BasePlugin:
                 to_update = {}
                 if do_update_name_or_time:
                     for unit in self.UNITS:
-
                         name = self.name + " " + unit
-                        Domoticz.Log(self.display_battery_in_name)
                         if self.display_battery_in_name != "0":
                             name += " " + str(self.bat_level) + "%"
-                        Domoticz.Log(name)
                         to_update[unit] = dict(unit=self.UNITS[unit][0],
                                                name=name,
                                                bat_lvl=self.bat_level)
 
-                last_level = self.rest_api.translate_command_to_val(str_data['lastCommand']['command'])
+                key = "Working"
+                if "run" == str_data['cleanMissionStatus']['phase'] and Devices[self.UNITS[key][0]].nValue == 0:
+                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=1, s_value="On"))
+                elif "run" != str_data['cleanMissionStatus']['phase'] and Devices[self.UNITS[key][0]].nValue == 1:
+                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=0, s_value="Off"))
+
                 key = "Advanced"
-                if last_level != -1 and last_level != Devices[self.UNITS[key][0]].sValue:
-                    tmp_attr_dict = dict(unit=self.UNITS[key][0], n_value=last_level, s_value=last_level)
-                    if key in to_update.keys():
-                        to_update[key].update(tmp_attr_dict)
-                    else:
-                        to_update[key] = tmp_attr_dict
+                last_level = self.rest_api.translate_command_to_val(str_data['lastCommand']['command'])
+                if last_level != -1 and last_level != Devices[self.UNITS[key][0]].nValue:
+                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=last_level, s_value=last_level))
 
                 key = "Bin"
                 if str_data['bin']['full']:
@@ -202,14 +203,11 @@ class BasePlugin:
                     n_val = 0
                     s_val = "Off"
                 if n_val != Devices[self.UNITS[key][0]].nValue:
-                    tmp_attr_dict = dict(unit=self.UNITS[key][0], n_value=n_val, s_value=s_val)
-                    if key in to_update.keys():
-                        to_update[key].update(tmp_attr_dict)
-                    else:
-                        to_update[key] = tmp_attr_dict
+                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=n_val, s_value=s_val))
 
-                for update_dict in to_update:
-                    update_device(**to_update[update_dict])
+                for dev_dict in to_update:
+                    Domoticz.Debug(str(to_update[dev_dict]))
+                    update_device(**to_update[dev_dict])
 
         elif status == 302:
             Domoticz.Log("Page Moved Error.")
@@ -225,7 +223,7 @@ class BasePlugin:
     def onCommand(self, Unit, Command, Level, Hue):
         Domoticz.Debug("onCommand called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
 
-        if Unit == self.UNITS['Advanced'] and Command == 'Set Level':
+        if Unit == self.UNITS['Advanced'][0]:
             if Level in self.AVAILABLE_LEVELS:
                 if self.isConnected():
                     self.send_data['URL'] = self.rest_api.get_local_url(Level)
@@ -238,15 +236,15 @@ class BasePlugin:
                 Domoticz.Log("This mode is not supported yet.")
             return
 
-        if Unit == self.UNITS['Working']:
+        if Unit == self.UNITS['Working'][0]:
             if Command == 'Off':
                 n_val = 0
-                roomba_command = "pause"
+                roomba_command = "/pause"
             elif Command == 'On':
                 n_val = 1
-                roomba_command = "start"
+                roomba_command = "/start"
             else:
-                Domoticz.Error("Unknown command for 'Working' device." )
+                Domoticz.Error("Unknown command for 'Working' device.")
                 return
 
             if self.isConnected():
@@ -411,3 +409,10 @@ def update_device(unit,
     else:
         global _plugin
         _plugin.CreateDevices()
+
+
+def update_dict(dict_to_update, key, dict):
+    if key in dict_to_update.keys():
+        dict_to_update[key].update(dict)
+    else:
+        dict_to_update[key] = dict
