@@ -1,10 +1,14 @@
 # iRobot plugin based on rest980 api
 # Author: ajarzyna, 2020
 """
-<plugin key="REST980" name="iRobot based on rest980" author="ajarzyn" version="0.0.1">
+<plugin key="REST980" name="iRobot based on rest980" author="ajarzyn" version="0.0.2">
     <description>
         <h2>iRobot based on rest980</h2><br/>
         This plugins uses rest980 by koalazak, to control iRobot.
+
+        Be aware:
+         Values greater than 30 seconds will cause a message to be regularly logged about the plugin not responding.
+         The plugin will actually function correctly with values greater than 30 though.
     </description>
     <params>
         <param field="Address" label="rest980's IP Address" width="200px" required="true" default="127.0.0.1"/>
@@ -15,6 +19,7 @@
                 <option label="No" value="0" default="true"/>
             </options>
         </param>
+        <param field="Mode2" label="Data pull interval in seconds" width="150px" default="25"/>
         <param field="Mode6" label="Debug" width="150px">
             <options>
                 <option label="None" value="0" default="true"/>
@@ -72,6 +77,9 @@ class Rest980Api:
                 return act
         return -1
 
+    def is_action(self, item):
+        return item in self.actions
+
 
 # add icons for roomba, maybe from: https://thenounproject.com/term/roomba/3177860/
 class BasePlugin:
@@ -84,9 +92,12 @@ class BasePlugin:
         self.bat_level = 100
         self.AVAILABLE_LEVELS = [00, 10, 20, 30, 40]
 
+        self._wait_for_update = True
+        self.repeat_request = 5
+
         self.UNITS = {
             'Working': [1, dict(TypeName="Switch", Image=9, Used=1)],
-            'Advanced': [2, dict(TypeName="Selector Switch", Used=1, Image=7,
+            'Advanced': [2, dict(TypeName="Selector Switch", Used=9, Image=7,
                                  Options={"LevelActions": "|||||",
                                           "LevelNames": "stop|start|pause|resume|dock|cleanRoom",
                                           "LevelOffHidden": "false",
@@ -104,7 +115,7 @@ class BasePlugin:
 
     def CreateDevices(self):
         for unit in self.UNITS:
-            if self.UNITS[unit][0] not in Devices:
+            if self._get_dev_id(unit) not in Devices:
                 Domoticz.Device(**self.UNITS[unit][1]).Create()
 
     def InitializeREST980Connection(self):
@@ -119,6 +130,8 @@ class BasePlugin:
         self.name = Parameters['Name']
         self.host = Parameters['Address']
         self.port = Parameters['Port']
+
+        Domoticz.Heartbeat(int(Parameters['Mode2']))
 
         self.display_battery_in_name = Parameters['Mode1']
 
@@ -141,19 +154,29 @@ class BasePlugin:
 
         # Create devices for roomba
         self.CreateDevices()
+        self._request_devices_state()
+
 
     def onStop(self):
         Domoticz.Debug("onStop - Plugin is stopping.")
-        if self.http_conn is not None:
-            self.http_conn.Disconnect()
+        _l_con = self.http_conn
+        if self.isConnected(_l_con, False):
+            _l_con.Disconnect()
+        self.http_conn = None
+
+    def onDisconnect(self, Connection):
+        Domoticz.Debug("onDisconnect called for connection to: "+Connection.Address+":"+Connection.Port)
 
     def onConnect(self, Connection, status, Description):
         if status == 0:
             Domoticz.Debug("rest980 connected successfully.")
             while not self.que.empty():
                 item = self.que.get()
-                self.send_data['URL'] = self.rest_api.get_local_url(item)
-                Connection.Send(self.send_data)
+                if self.rest_api.is_action(item):
+                    data_refresh = True
+                else:
+                    data_refresh = False
+                self._sent_message(Connection, item, data_refresh)
         else:
             Domoticz.Log("Failed to connect (" + str(status)
                          + ") to: " + self.host + ":" + self.port
@@ -161,15 +184,20 @@ class BasePlugin:
 
     def onMessage(self, Connection, Data):
         status = int(Data["Status"])
-
+        Domoticz.Debug("Status: " + str(status))
         if status == 200:
             str_data = json.loads(Data["Data"].decode("utf-8", "ignore"))
-            if "batPct" in str_data:
+            Domoticz.Debug("json: " + str(str_data.keys()))
+            if 'ok' in str_data.keys():
+                Domoticz.Debug(str(str_data.values()))
+                if str_data['ok'] is None:
+                    self._request_devices_state(Connection)
+                return
+            if "batPct" in str_data.keys():
                 do_update_name_or_time = False
                 if str(str_data['name']) != self.name:
                     self.name = str(str_data['name'])
                     do_update_name_or_time = True
-
                 if self.bat_level != str_data['batPct']:
                     self.bat_level = str_data['batPct']
                     do_update_name_or_time = True
@@ -180,20 +208,21 @@ class BasePlugin:
                         name = self.name + " " + unit
                         if self.display_battery_in_name != "0":
                             name += " " + str(self.bat_level) + "%"
-                        to_update[unit] = dict(unit=self.UNITS[unit][0],
+                        to_update[unit] = dict(unit=self._get_dev_id(unit),
                                                name=name,
                                                bat_lvl=self.bat_level)
 
                 key = "Working"
-                if "run" == str_data['cleanMissionStatus']['phase'] and Devices[self.UNITS[key][0]].nValue == 0:
-                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=1, s_value="On"))
-                elif "run" != str_data['cleanMissionStatus']['phase'] and Devices[self.UNITS[key][0]].nValue == 1:
-                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=0, s_value="Off"))
+                if "run" == str_data['cleanMissionStatus']['phase'] and self._get_dev(key).nValue == 0:
+                    update_dict(to_update, key, dict(unit=self._get_dev_id(key), n_value=1, s_value="On"))
+                elif "run" != str_data['cleanMissionStatus']['phase'] and self._get_dev(key).nValue == 1:
+                    update_dict(to_update, key, dict(unit=self._get_dev_id(key), n_value=0, s_value="Off"))
 
                 key = "Advanced"
                 last_level = self.rest_api.translate_command_to_val(str_data['lastCommand']['command'])
-                if last_level != -1 and last_level != Devices[self.UNITS[key][0]].nValue:
-                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=last_level, s_value=last_level))
+                Domoticz.Debug("Advanced: " + str(last_level) + " prev " + str(self._get_dev(key).nValue))
+                if last_level != -1 and last_level != self._get_dev(key).nValue:
+                    update_dict(to_update, key, dict(unit=self._get_dev_id(key), n_value=last_level, s_value=last_level))
 
                 key = "Bin"
                 if str_data['bin']['full']:
@@ -202,16 +231,26 @@ class BasePlugin:
                 else:
                     n_val = 0
                     s_val = "Off"
-                if n_val != Devices[self.UNITS[key][0]].nValue:
-                    update_dict(to_update, key, dict(unit=self.UNITS[key][0], n_value=n_val, s_value=s_val))
+                if n_val != self._get_dev(key).nValue:
+                    update_dict(to_update, key, dict(unit=self._get_dev_id(key), n_value=n_val, s_value=s_val))
+
+                if self._wait_for_update and not to_update and self.repeat_request:
+                    self.repeat_request -= 1
+                    self._request_devices_state(Connection)
+                    return
+                else:
+                    self.repeat_request = 5
+                    self._wait_for_update = False
 
                 for dev_dict in to_update:
+                    Domoticz.Debug(str(dev_dict))
                     Domoticz.Debug(str(to_update[dev_dict]))
                     update_device(**to_update[dev_dict])
 
         elif status == 302:
             Domoticz.Log("Page Moved Error.")
             send_data['URL'] = Data["Headers"]["Location"]
+            Domoticz.Debug(type(send_data))
             Connection.Send(send_data)
         elif status == 400:
             Domoticz.Error("rest980 returned a Bad Request Error.")
@@ -223,64 +262,75 @@ class BasePlugin:
     def onCommand(self, Unit, Command, Level, Hue):
         Domoticz.Debug("onCommand called for Unit " + str(Unit) + ": Parameter '" + str(Command) + "', Level: " + str(Level))
 
-        if Unit == self.UNITS['Advanced'][0]:
+        if self._wait_for_update:
+            Domoticz.Debug('Waiting for device update. State changes not possible.')
+            return
+
+        while not self.que.empty():
+            self.que.get()
+
+        if Unit == self._get_dev_id('Advanced'):
             if Level in self.AVAILABLE_LEVELS:
-                if self.isConnected():
-                    self.send_data['URL'] = self.rest_api.get_local_url(Level)
-                    self.http_conn.Send(self.send_data)
-                    update_device(unit=Unit, n_value=Level, s_value=Level, timed_out=0)
-                    Domoticz.Debug("iRobot mode changed.")
-                else:
-                    self.que.put(Level)
+                self._sent_message(self.http_conn, Level, request_device_state_update=True)
             else:
                 Domoticz.Log("This mode is not supported yet.")
             return
 
-        if Unit == self.UNITS['Working'][0]:
+        if Unit == self._get_dev_id('Working'):
             if Command == 'Off':
-                n_val = 0
                 roomba_command = "/pause"
             elif Command == 'On':
-                n_val = 1
-                roomba_command = "/start"
+                if self._get_dev('Advanced').nValue == 20:
+                    roomba_command = "/resume"
+                else:
+                    roomba_command = "/start"
             else:
                 Domoticz.Error("Unknown command for 'Working' device.")
                 return
 
-            if self.isConnected():
-                self.send_data['URL'] = self.rest_api.get_local_url(roomba_command)
-                self.http_conn.Send(self.send_data)
-                update_device(unit=Unit, n_value=n_val, s_value=Command, timed_out=0)
-                Domoticz.Debug("iRobot mode changed.")
-            else:
-                self.que.put(roomba_command)
-
-    def onDisconnect(self, Connection):
-        Domoticz.Debug("onDisconnect called for connection to: "+Connection.Address+":"+Connection.Port)
+            self._sent_message(self.http_conn, roomba_command, request_device_state_update=True)
 
     def onHeartbeat(self):
-        Domoticz.Debug("onHeartbeat called")
-        if self.isConnected():
-            self.send_data['URL'] = self.rest_api.get_local_url("state")
-            self.http_conn.Send(self.send_data)
-        else:
-            self.que.put("state")
+        Domoticz.Debug("onHeartbeat called.")
+        self._request_devices_state()
 
-    def isConnected(self):
-        if self.http_conn is not None:
-            Domoticz.Debug("Connection is alive." + str(self.http_conn))
-            if self.http_conn.Connecting():
+    def isConnected(self, connection, reconnect=True):
+        if connection is not None:
+            Domoticz.Debug("Connection is alive." + str(connection.Name))
+            if connection.Connecting():
                 Domoticz.Debug("rest980 Connecting...")
-            elif self.http_conn.Connected():
-                Domoticz.Debug("rest980 Connected. Requesting data.")
+            elif connection.Connected():
+                Domoticz.Debug("rest980 Connected.")
                 return True
             else:
-                self.http_conn.Connect()
-        else:
+                connection.Connect()
+        elif reconnect:
             Domoticz.Debug("No connection creating new one.")
             self.InitializeREST980Connection()
-
         return False
+
+    def _get_dev_id(self, key):
+        return self.UNITS[key][0]
+
+    def _get_dev(self, key):
+        return Devices[self._get_dev_id(key)]
+
+    def _sent_message(self, connection, command, request_device_state_update=True):
+        Domoticz.Debug("_sent_message: " + str(command) + " connection: " + str(connection))
+        if self.isConnected(connection):
+            self.send_data['URL'] = self.rest_api.get_local_url(command)
+            Domoticz.Debug("_sent_message: " + str(self.send_data['URL']))
+            connection.Send(self.send_data)
+            Domoticz.Debug("_sent_message: post Send, request_device_state_update: " + str(request_device_state_update))
+            if request_device_state_update:
+                self._wait_for_update = True
+        else:
+            self.que.put(command)
+
+    def _request_devices_state(self, connection=None):
+        l_con = connection if connection else self.http_conn
+        Domoticz.Debug("_request_devices_state: " + str(l_con))
+        self._sent_message(connection=l_con, command="state", request_device_state_update=False)
 
 
 global _plugin
